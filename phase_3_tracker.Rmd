@@ -1,0 +1,600 @@
+---
+title: "Phase 3 tracker"
+output: 
+  flexdashboard::flex_dashboard:
+    storyboard: true
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard); library(RisePhaseIIILibrary); library(tidyverse); library(googlesheets4); library(yaml)
+creds <- yaml::read_yaml("creds.yaml")
+
+```
+
+```{r setupdata}
+
+googlesheets4::gs4_auth(email = creds$email)
+tracker_data_raw <- read_sheet(ss = creds$tracker$url, sheet = creds$tracker$tracking_sheet, skip = 1, col_types = "cnccccnlllllllnlllc") 
+
+tracker_data <- tracker_data_raw %>% 
+  filter(!is.na(Name)) %>% 
+  select(`1. Consent`:`7. Feedback`)
+
+review_data <- read_sheet(ss = creds$interview_sheet$url, sheet = creds$interview_sheet$responses_sheet, col_types = "cccccccccccccccccccccc") %>% 
+  select(`Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, `Interviewer Name (you, the interviewer)`, Intelligence:Boost) %>% 
+  gather(Trait, Rating, -`Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, -`Interviewer Name (you, the interviewer)`) %>% 
+  mutate(score = as.numeric(readr::parse_number(Rating)),
+         score = ifelse(score == -9, NA, score)) %>% 
+  group_by(Trait) %>% 
+  mutate(score = score - mean(score, na.rm =T)) %>% 
+  ungroup
+
+
+teacher_ratings <- read_sheet(creds$teacher_interviews$url, sheet = creds$teacher_interviews$group_1, col_types = "ccnnnnnnnnn")
+
+for(s in creds$teacher_interviews[3:length(creds$teacher_interviews)]) {
+  teacher_ratings <- bind_rows(teacher_ratings,
+                               read_sheet(creds$teacher_interviews$url, sheet = s, col_types = "ccnnnnnnnnn"))
+}
+
+teacher_ratings_long <- teacher_ratings %>%   
+  gather(Trait, `Teacher Score`, -Student:-`Student ID`) %>% 
+  filter(!is.na(`Student ID`)) %>% 
+  rename(Candidate = `Student ID`) %>% 
+  group_by(Trait) %>% 
+  mutate(`Teacher Score` = scale(`Teacher Score`)) %>% 
+  ungroup
+
+peer_nominations <- read_sheet(creds$peer_nominations$url, creds$peer_nominations$group_1) %>%
+  mutate(`Student ID` = as.character(`Student ID`))
+
+for(s in creds$peer_nominations[3:length(creds$peer_nominations)]) {
+  peer_nominations <- bind_rows(peer_nominations,
+                                read_sheet(creds$peer_nominations$url, sheet = s))
+}
+
+noms <- peer_nominations %>% 
+  select(contains("classmate")) %>% 
+  gather(nomination, Name) %>% 
+  mutate(score = readr::parse_number(nomination),
+         nomination = gsub(" [0-9]", "", nomination)) %>% 
+  group_by(Name, nomination) %>% 
+  tally() %>% 
+  left_join(tracker_data_raw %>% select(Name, `Student ID`), by = "Name") %>% 
+  mutate(Trait = case_when(nomination == "Boostable classmate" ~ "Boost",
+                           nomination == "Intelligent classmate" ~ "Intelligence",
+                           nomination == "Persevering classmate" ~ "Perseverance",
+                           nomination == "High integrity classmate" ~ "Integrity",
+                           nomination == "Empathetic classmate" ~ "Empathy",
+                           TRUE ~ "Spike")) %>% 
+  rename(Candidate = `Student ID`)
+
+
+```
+
+Pipeline {.storyboard}
+====
+
+
+### Student Pipeline
+
+```{r}
+tracker_data %>% 
+  gather(Step, Completed) %>% 
+  group_by(Step) %>% 
+  summarise(`Number completed` = sum(Completed)) %>% 
+  ggplot(aes(x = Step, y = `Number completed`)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.6) +
+  ggthemes::theme_hc() +
+  theme(axis.text.x = element_text(angle = 270))
+```
+
+
+### Teacher pipeline
+
+```{r}
+
+```
+
+
+Intelligence {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Intelligence"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  facet_grid(~`Evidence Type`) +
+  theme(axis.text.y= element_blank()) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr) ) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
+
+Perseverance {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Perseverance"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  theme(axis.text.y= element_blank()) +
+  facet_grid(~`Evidence Type`) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr)) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
+
+
+Empathy {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Empathy"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  facet_grid(~`Evidence Type`) +
+  theme(axis.text.y= element_blank()) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr)) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
+
+Integrity {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Integrity"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  facet_grid(~`Evidence Type`) +
+  theme(axis.text.y= element_blank()) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr)) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
+
+Spike {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Spike"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  facet_grid(~`Evidence Type`) +
+  theme(axis.text.y= element_blank()) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr)) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
+
+
+Boost {.storyboard}
+====
+
+### Teacher and peer scores
+
+```{r}
+tr <- "Boost"
+teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name)) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>%
+  select(`Student`, `Teacher Score`, `Peer Score`) %>%
+  gather(Type, Score, -Student) %>%
+  group_by(Student) %>% 
+  mutate(mean_score = mean(Score)) %>%
+  ungroup %>% 
+  mutate(Student = reorder(Student, mean_score)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  coord_flip() +
+  geom_point() +
+  theme(axis.text.y= element_blank()) +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Teacher and peer scores of ", tr))
+
+```
+
+### Adding interviews
+
+```{r}
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  left_join(teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
+         score = scale(score)) %>% 
+  rename(`Interviewer Score` = score) %>% 
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  filter(!is.na(`Teacher Score`)) %>%
+  gather(Type, Score, -1:-2) %>% 
+  mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
+  group_by(Type, Student) %>%
+  filter(1:n()<=ifelse(Type=="Interviewer Score",n(), 1)) %>%
+  ggplot(aes(x = Student, y = Score, colour = Type)) +
+  geom_jitter(width = 0.1) + 
+  coord_flip() +
+  ggthemes::theme_hc() +
+  facet_grid(~`Evidence Type`) +
+  theme(axis.text.y= element_blank()) +
+  labs(title = paste0("Teacher, peer and interviewer scores of ", tr)) 
+
+```
+
+### Comparing ground truth to interviews
+
+```{r}
+ground_truth <- teacher_ratings_long %>% 
+  filter(Trait == tr) %>% 
+  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`)
+  
+
+review_data %>% 
+  filter(Trait == tr) %>% 
+  rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
+  group_by(Candidate) %>%
+  summarize(`Interview Score Average` = mean(score)) %>% 
+  left_join(ground_truth, by  = "Candidate") %>%
+  mutate(`Ground Truth Score` = scale(`Peer Score` + `Teacher Score`)) %>% 
+  ggplot(aes(x = `Ground Truth Score`, y = `Interview Score Average`)) +
+  geom_point() +
+  ggthemes::theme_hc() +
+  labs(title = paste0("Ground truth vs interviews in ", tr))
+
+```
