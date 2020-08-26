@@ -184,7 +184,7 @@ data_list <- list(N = nrow(modeling_df),
                   n_cut = max(teacher_ratings_for_model$`Teacher Score Raw`)-1)
 
 test_run <- sampling(compiled_model, data = data_list, iter = 1000, cores = 4, chains = 4)
-
+print(test_run, c("teacher_sigma", "student_sigma"))
 
 eigenvalues <- matrix(get_posterior_mean(test_run, "eigenvalues")[,5], 6, 3)
 proportions_of_variance <- as.data.frame(apply(eigenvalues[6:1,], 2, function(x) x/sum(x)))
@@ -209,6 +209,130 @@ peer_scores <- matrix(get_posterior_mean(test_run, "theta")[,5], max(student_num
 
 names(peer_scores) <- attributes$Trait
 
-bind_cols(student_numbers, peer_scores) %>% View()
+bind_cols(student_numbers, peer_scores) %>% 
+  left_join(tracker_data_raw %>% select(`Student ID`, Name), by = "Name") %>% 
   write_sheet(ss =creds$tracker$url, sheet = "Ground truth scores")
 
+bind_cols(student_numbers, peer_scores) %>% 
+  select(group, Name, Boost:Spike) %>% 
+  gather(Trait, Score, -group, -Name) %>%
+  ggplot(aes(x = Score, fill = group)) + geom_density(alpha = 0.4) +
+  facet_wrap(~Trait)
+
+ground_truth <- bind_cols(student_numbers, peer_scores) %>% 
+  select(group, Name, Boost:Spike) %>% 
+  gather(Trait, Score, -group, -Name) %>%
+  left_join(tracker_data_raw %>% select(`Student ID`, Name), by = "Name") 
+
+first_pc <- function(x) {
+  x1 <- x %>% select(Name, Trait, `Interview score`) %>% 
+    spread(Trait, `Interview score`)
+  x2 <- x %>% 
+    select(Trait, Score) %>% 
+    spread(Trait, Score)
+  names(x2) <- paste0("GT_", names(x2))
+  bind_cols(x1, x2)
+}
+
+all_measurements <- interview_data %>%
+  group_by(Interviewer) %>% 
+  mutate(scaled_score = scale(`Interview Score`)) %>% 
+  group_by(`Student ID`, Name, Trait) %>% 
+  summarise(`Interview score` = mean(scaled_score, na.rm = T)) %>%
+  left_join(ground_truth, by = c("Student ID", "Name", "Trait")) %>% 
+  group_by(group) %>% 
+  mutate(`Interview score` = scale(`Interview score`)) %>% 
+  filter(!is.na(`Interview score`) & !is.na(Score)) %>% 
+  group_by(group, Name) %>% 
+  do(first_pc(.))  %>% 
+  ungroup
+
+
+interview_data_model <- interview_data %>% 
+  filter(!is.na(`Interview Score`) & `Interview Score`>0) %>% 
+  left_join(student_numbers_2, by = "Name") %>% 
+  left_join(attributes, by = "Trait") %>%
+  ungroup %>%
+  mutate(interviewer_index = as.numeric(factor(Interviewer))) %>% 
+  filter(!is.na(group))
+
+
+
+interviewer_mod_compiled <- stan_model("interview_model.stan")
+
+interview_model_data <- list(N= nrow(interview_data_model), 
+                             R = max(interview_data_model$interviewer_index),
+                             J = max(student_numbers$student_index),
+                             C = max(interview_data_model$trait_index),
+                             y = interview_data_model$`Interview Score`, 
+                             reviewer = interview_data_model$interviewer_index,
+                             reviewee = interview_data_model$student_index,
+                             concept =  interview_data_model$trait_index)
+  
+
+interview_fit <- sampling(interviewer_mod_compiled, data = interview_model_data, cores = 4, chains = 4, iter = 1000)
+
+
+interview_scores <- as.data.frame(matrix(get_posterior_mean(interview_fit, pars = "latent_scores")[,5], max(student_numbers$student_index), 6, byrow = T))
+names(interview_scores) <- attributes$Trait
+
+bind_cols(student_numbers,interview_scores) %>% 
+  filter(student_index %in% interview_data_model$student_index) %>% 
+  gather(Trait, Interview_score, -Name, -group, -student_index) %>% 
+  left_join(ground_truth) %>% 
+  ggplot(aes(y = Score, x = Interview_score, colour = group)) +
+  geom_point() +
+  facet_wrap(~Trait) +
+  ggthemes::theme_hc() +
+  geom_smooth(aes(group = 1), method = "lm") +
+  labs(title = "Interview scores vs ground truth", x = "Interview score", "Ground truth score")
+
+
+first_pc2 <- function(x) {
+  interview <- rowSums(x %>% select(Boost:Spike) %>% as.matrix())
+  
+  gt <- rowSums(x %>% select(GT_Boost:GT_Spike) %>% as.matrix())
+  tibble(interview = interview, ground_truth = gt)
+}
+  
+all_measurements %>% 
+  group_by(group) %>%
+  do(first_pc2(.)) %>% 
+  ggplot(aes(x = ground_truth, y = interview)) +
+  geom_point() +
+  geom_smooth(method = "lm", aes(colour = group)) +
+  facet_grid(~group)
+
+
+plot(interview, gt)
+
+interview_data %>%
+  group_by(Interviewer) %>% 
+  mutate(scaled_score = scale(`Interview Score`)) %>% 
+  group_by(`Student ID`, Name, Trait) %>% 
+  summarise(`Interview score` = mean(scaled_score)) %>%
+  left_join(ground_truth, by = c("Student ID", "Name", "Trait")) %>% 
+  group_by(group) %>% 
+  mutate(`Interview score` = scale(`Interview score`)) %>% 
+  ggplot(aes(x = Score, y = `Interview score`, colour = group)) +
+  geom_point() +
+  facet_wrap(~Trait) +
+  labs(x = "Ground truth score (teacher and classmate reviews)") +
+  geom_smooth(method = "lm", se = F)
+    
+
+simple_model_data <- interview_data %>%
+  group_by(Interviewer) %>% 
+  mutate(scaled_score = scale(`Interview Score`)) %>% 
+  group_by(`Student ID`, Name, Trait) %>% 
+  summarise(`Interview score` = mean(scaled_score)) %>%
+  left_join(ground_truth, by = c("Student ID", "Name", "Trait")) #%>% 
+  # group_by(group) %>% 
+  # mutate(`Interview score` = scale(`Interview score`)) 
+
+
+library(rstanarm)  
+
+lme_fit <- stan_lmer(Score ~ `Interview score` + (1  | group:Trait), data = simple_model_data)
+
+hist(as.data.frame(lme_fit, pars = "`Interview score`")[,1])

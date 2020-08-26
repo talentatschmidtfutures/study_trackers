@@ -16,61 +16,186 @@ creds <- yaml::read_yaml("creds.yaml")
 ```{r setupdata}
 
 googlesheets4::gs4_auth(email = creds$email)
-tracker_data_raw <- read_sheet(ss = creds$tracker$url, sheet = creds$tracker$tracking_sheet, skip = 1, col_types = "cnccccnlllllllnlllc") 
+
+tracker_data_raw <- read_sheet(ss = creds$tracker$url, sheet = creds$tracker$tracking_sheet, skip = 1, col_types = "cnccccnlllllllnlllc") %>% 
+  mutate(`Student ID` = tolower(`Student ID`))
 
 tracker_data <- tracker_data_raw %>% 
   filter(!is.na(Name)) %>% 
   select(`1. Consent`:`7. Feedback`)
 
-review_data <- read_sheet(ss = creds$interview_sheet$url, sheet = creds$interview_sheet$responses_sheet, col_types = "cccccccccccccccccccccc") %>% 
+rmet_responses <- read_sheet(ss = creds$rmet$url, sheet = creds$rmet$responses_sheet) 
+rmet_answers <- read_sheet(ss = creds$rmet$url, sheet = creds$rmet$answers) 
+
+rmet_answers <- rmet_answers %>% 
+  mutate(question_number = 1:n())
+
+rmet_responses_long <- rmet_responses %>% 
+  gather(Question, Answer, -1:-3) %>% 
+  mutate(question_number = as.numeric(str_extract(Question, "[0-9]{1,2}")) - 3) %>% 
+  left_join(rmet_answers, by = "question_number") %>% 
+  group_by(`What is your name? (First then last)`) %>% 
+  filter(Timestamp == min(Timestamp)) %>% 
+  summarize(`Student ID` = first(`What is your student ID? (This is a unique numeric ID  associated with you at your school; if you do not have one, use the email with which we have corresponded with you.)`),
+            score = sum(Answer == `Correct Answer`)) %>% 
+  ungroup %>% 
+  mutate(Percentile = ntile(score, 100), 
+         `Student ID` = tolower(`Student ID`))
+
+
+interview_data <- read_sheet(ss = creds$interview_sheet$url, sheet = creds$interview_sheet$responses_sheet, col_types = "cccccccccccccccccccccc") %>% 
   select(`Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, `Interviewer Name (you, the interviewer)`, Intelligence:Boost) %>% 
   gather(Trait, Rating, -`Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, -`Interviewer Name (you, the interviewer)`) %>% 
-  mutate(score = as.numeric(readr::parse_number(Rating)),
-         score = ifelse(score == -9, NA, score)) %>% 
-  group_by(Trait) %>% 
-  mutate(score = score - mean(score, na.rm =T)) %>% 
-  ungroup
+  rename(`Student ID` = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`,
+         Interviewer = `Interviewer Name (you, the interviewer)`) %>%
+  mutate(`Interview Score` = as.numeric(readr::parse_number(Rating)),
+         `Interview Score` = ifelse(`Interview Score` == -9, NA, `Interview Score`),
+         `Student ID` = tolower(`Student ID`)) %>%
+  ungroup %>% 
+  select(Interviewer, `Student ID`, Trait, `Interview Score`) %>% 
+  left_join(tracker_data_raw %>% select(`Student ID`, Name), by = "Student ID")
 
-
-teacher_ratings <- read_sheet(creds$teacher_interviews$url, sheet = creds$teacher_interviews$group_1, col_types = "ccnnnnnnnnnc")
+teacher_ratings <- read_sheet(creds$teacher_interviews$url, sheet = creds$teacher_interviews$group_1, col_types = "ccnnnnnnnnnc") %>% 
+  mutate(group = creds$teacher_interviews$group_1)
 
 for(s in creds$teacher_interviews[3:length(creds$teacher_interviews)]) {
   teacher_ratings <- bind_rows(teacher_ratings,
-                               read_sheet(creds$teacher_interviews$url, sheet = s, col_types = "ccnnnnnnnnnc"))
+                               read_sheet(creds$teacher_interviews$url, sheet = s, col_types = "ccnnnnnnnnnc") %>% 
+  mutate(group = s))
 }
 
+teacher_ratings <- teacher_ratings %>% 
+  mutate(`Student ID` = tolower(`Student ID`))
+
 teacher_ratings_long <- teacher_ratings %>%   
-  select(Student:`Interview-ability`) %>%
-  gather(Trait, `Teacher Score`, -Student:-`Student ID`) %>% 
-  filter(!is.na(`Student ID`)) %>% 
-  rename(Candidate = `Student ID`) %>% 
-  group_by(Trait) %>% 
+  select(Student:`Interview-ability`, group) %>%
+  gather(Trait, `Teacher Score`, -Student:-`Student ID`, -group) %>% 
+  group_by(Trait, group) %>% 
   mutate(`Teacher Score` = scale(`Teacher Score`)) %>% 
-  ungroup
+  ungroup %>% 
+  group_by(Student) %>% 
+  mutate(Interviewability = `Teacher Score`[Trait == "Interview-ability"], 
+         Creativity = `Teacher Score`[Trait == "Creativity"]) %>% 
+  rename(Name = Student)
+
 
 peer_nominations <- read_sheet(creds$peer_nominations$url, creds$peer_nominations$group_1) %>%
-  mutate(`Student ID` = as.character(`Student ID`))
+  mutate(`Student ID` = as.character(`Student ID`), 
+         group_peer = creds$peer_nominations$group_1)
 
 for(s in creds$peer_nominations[3:length(creds$peer_nominations)]) {
   peer_nominations <- bind_rows(peer_nominations,
-                                read_sheet(creds$peer_nominations$url, sheet = s))
+                                read_sheet(creds$peer_nominations$url, sheet = s)%>% 
+    mutate(group_peer = s)) 
 }
 
-noms <- peer_nominations %>% 
-  select(contains("classmate")) %>% 
-  gather(nomination, Name) %>% 
-  mutate(score = readr::parse_number(nomination),
+peer_nominations <- peer_nominations %>% 
+  mutate(`Student ID` = tolower(`Student ID`))
+
+self_ratings <- peer_nominations %>% 
+  select(`Student ID`, `Where would you place yourself in terms of intelligence?`:`Where would you place yourself relative to your peers in terms of need? If given more resources, how much more likely would you be to accomplish your dreams?`, group_peer)
+
+self_ratings_long <- self_ratings %>% 
+  rename(Intelligence = `Where would you place yourself in terms of intelligence?`, 
+         Integrity = `Where would you place yourself in terms of integrity?`, 
+         Perseverance = `Where would you place yourself in terms of perseverance?`, 
+         Empathy = `Where would you place yourself in terms of empathy?`, 
+         Spike = `Where would you place yourself relative to your peers in terms of how driven and passionate you are? How likely are you to dream a project and implement it?`, 
+         Boost = `Where would you place yourself relative to your peers in terms of need? If given more resources, how much more likely would you be to accomplish your dreams?`) %>% 
+  gather(Trait, Response, -group_peer, -`Student ID`) %>% 
+  mutate(Score = parse_number(Response),
+         `Student ID` = tolower(`Student ID`)) %>% 
+  group_by(group_peer, Trait) %>% 
+  mutate(scaled_score = scale(Score)) %>% 
+  left_join(tracker_data_raw %>% select(Name, `Student ID`) %>% 
+              mutate(`Student ID` = tolower(`Student ID`)), by = "Student ID") 
+
+peer_noms_raw <- peer_nominations %>% 
+  select(contains("classmate"), group_peer) %>% 
+  gather(nomination, Name, -group_peer) %>% 
+  mutate(nomination_number = readr::parse_number(nomination),
          nomination = gsub(" [0-9]", "", nomination)) %>% 
-  group_by(Name, nomination) %>% 
-  tally() %>% 
-  left_join(tracker_data_raw %>% select(Name, `Student ID`), by = "Name") %>% 
   mutate(Trait = case_when(nomination == "Boostable classmate" ~ "Boost",
                            nomination == "Intelligent classmate" ~ "Intelligence",
                            nomination == "Persevering classmate" ~ "Perseverance",
                            nomination == "High integrity classmate" ~ "Integrity",
                            nomination == "Empathetic classmate" ~ "Empathy",
                            TRUE ~ "Spike")) %>% 
-  rename(Candidate = `Student ID`)
+  select(-nomination) %>% 
+  left_join(tracker_data_raw %>% select(Name, `Student ID`), by = "Name")
+
+
+noms <- peer_noms_raw %>% 
+  group_by(Name, Trait, group_peer) %>% 
+  summarise(`N peer nominations` = n(),
+            `Student ID` = first(`Student ID`)) %>% 
+  arrange(group_peer, Trait, `N peer nominations`)
+
+
+ground_truth <- teacher_ratings_long %>% 
+  left_join(noms, by = c("Name", "Student ID", "Trait")) %>% 
+  mutate(`N peer nominations` = ifelse(is.na(`N peer nominations`), 0, `N peer nominations`)) %>% 
+  group_by(group) %>% 
+  mutate(scaled_nominations = scale(`N peer nominations`)) %>% 
+  left_join(self_ratings_long %>% select(`Student ID`, Trait, Name, scaled_score) %>% rename(`Self-score` = scaled_score), by = c("Name", "Student ID", "Trait", "group_peer"))
+
+
+ground_truth %>% 
+  filter(!Trait %in% c("Interview-ability", "Creativity")) %>% 
+  ggplot(aes(x = `Teacher Score`, y = scaled_nominations, colour = group)) +
+  facet_wrap(~Trait + group) +
+  geom_smooth(method = "lm") +
+  geom_point() +
+  labs(y = "Peer nominator score") +
+  geom_abline(aes(intercept = 0, slope = 1))
+
+
+ground_truth %>% 
+  filter(!Trait %in% c("Interview-ability", "Creativity")) %>% 
+  ggplot(aes(x = `Teacher Score`, y = `Self-score`, colour = group)) +
+  facet_wrap(group~Trait ) +
+  geom_smooth(method = "lm") +
+  geom_point() +
+  labs(y = "Self-score") +
+  lims(y = c(-3, 3)) +
+  geom_abline(aes(intercept = 0, slope = 1))
+
+ground_truth %>% 
+  filter(!Trait %in% c("Interview-ability", "Creativity")) %>% 
+  ggplot(aes(x = scaled_nominations + `Teacher Score`, y = `Self-score`, colour = group)) +
+  facet_wrap(~Trait + group) +
+  geom_smooth(method = "lm") +
+  geom_point() +
+  labs(y = "Self-score", x = "Peer scores") +
+  lims(y = c(-3, 3)) +
+  geom_abline(aes(intercept = 0, slope = 1))
+
+ground_truth %>% 
+  filter(!Trait %in% c("Interview-ability", "Creativity")) %>%
+  left_join(rmet_responses_long, by = "Student ID") %>% 
+  group_by(group) %>% 
+  mutate(score = scale(score)) %>%
+  ggplot(aes(x = `Teacher Score`, y = score))+facet_wrap(~Trait + group) +
+  geom_smooth(method = "lm") +
+  geom_point()+
+  #lims(y = c(-3, 3)) +
+  labs(y = "RMET score") +
+  geom_abline(aes(intercept = 0, slope = 1))
+
+
+ground_truth %>% 
+  filter(!Trait %in% c("Interview-ability", "Creativity")) %>%
+  left_join(rmet_responses_long, by = "Student ID") %>% 
+  group_by(group) %>% 
+  mutate(score = scale(score)) %>%
+  ggplot(aes(x = `Teacher Score`, y = score))+facet_wrap(~Trait) +
+  geom_smooth(method = "lm") +
+  geom_point()+
+  #lims(y = c(-3, 3)) +
+  labs(y = "RMET score") +
+  geom_abline(aes(intercept = 0, slope = 1))
+
+
 
 
 ```
@@ -110,8 +235,10 @@ tr <- "Intelligence"
 teacher_ratings_long %>% 
   filter(Trait == tr) %>% 
   left_join(noms %>% rename(Student = Name)) %>% 
+  group_by(group) %>%
   mutate(n = ifelse(is.na(n), 0, n),
          `Peer Score` = scale(n)) %>%
+  ungroup %>%
   select(`Student`, `Teacher Score`, `Peer Score`) %>%
   gather(Type, Score, -Student) %>%
   group_by(Student) %>% 
@@ -121,7 +248,7 @@ teacher_ratings_long %>%
   ggplot(aes(x = Student, y = Score, colour = Type)) +
   coord_flip() +
   geom_point() +
-  theme(axis.text.y= element_blank()) +
+  #theme(axis.text.y= element_blank()) +
   ggthemes::theme_hc() +
   labs(title = paste0("Teacher and peer scores of ", tr))
 
@@ -135,14 +262,19 @@ review_data %>%
   rename(Candidate = `Candidate's Student ID (This is SOMETIMES their email! check the excel sheet)`, Interviewer = `Interviewer Name (you, the interviewer)`) %>% 
   left_join(teacher_ratings_long %>% 
   filter(Trait == tr) %>% 
-  left_join(noms %>% rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
-  mutate(n = ifelse(is.na(n), 0, n),
-         `Peer Score` = scale(n)) %>% 
-    select(Student, Candidate, `Peer Score`, `Teacher Score`), by = "Candidate") %>% 
+  left_join(noms %>% 
+              rename(Student = Name), by = c("Student", "Trait", "Candidate")) %>% 
+    mutate(n = ifelse(is.na(n), 0, n),
+           `Peer Score` = scale(n)) %>% 
+    select(Student, Candidate, `Peer Score`, `Teacher Score`, group), by = "Candidate") %>%
   mutate(Student = reorder(Student, `Teacher Score` + `Peer Score`),
          score = scale(score)) %>% 
   rename(`Interviewer Score` = score) %>% 
-  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`) %>%
+  select(`Interviewer`, `Student`, `Interviewer Score`, `Teacher Score`, `Peer Score`, group) %>%
+  group_by(group) %>% 
+  mutate(`Interviewer Score` = scale(`Interviewer Score`)) %>%
+  ungroup %>%
+  select(-group) %>%
   filter(!is.na(`Teacher Score`)) %>%
   gather(Type, Score, -1:-2) %>% 
   mutate(`Evidence Type` = ifelse(Type == "Interviewer Score", "Interview", "Ground Truth")) %>%
@@ -153,7 +285,7 @@ review_data %>%
   coord_flip() +
   ggthemes::theme_hc() +
   facet_grid(~`Evidence Type`) +
-  theme(axis.text.y= element_blank()) +
+  #theme(axis.text.y= element_blank()) +
   labs(title = paste0("Teacher, peer and interviewer scores of ", tr) ) 
 
 ```
