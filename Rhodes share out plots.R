@@ -448,7 +448,7 @@ interview_scores %>%
   geom_point(alpha = 0.2) +
   facet_wrap(~Trait) +
   geom_smooth(method = "lm") +
-  labs(x = "Interview score", y = "Peer score", title ="Agreement with peers was better") +
+  labs(x = "Interview score", y = "Peer score", title ="Interviewers agreed more strongly with peers") +
   ggthemes::theme_hc()
 
 
@@ -464,7 +464,8 @@ interview_scores %>%
   geom_point(alpha = 0.2) +
   facet_wrap(~Trait) +
   geom_smooth(method = "lm") +
-  labs(x = "Interview score", y = "'Ground truth' score", title = "So some agreement on 'ground truth'") +
+  labs(x = "Interview score", y = "'Ground truth' score", 
+       title = "So some agreement on 'ground truth'-- especially for Spike and Boost") +
   ggthemes::theme_hc()
 
 
@@ -493,11 +494,14 @@ interview_scores %>%
             teacher_theta = mean(teacher_theta)) %>% 
   ggplot(aes(x = Income_quintile, y = theta, group = Trait)) +
   geom_point() +
+  geom_text(data = tribble(~Trait, ~x, ~y, ~label,
+                           "Boost", 4, 0.7, "Ground Truth"), 
+            aes(x = x, y = y, label = label)) +
   geom_line() +
   ylim(-1.5,1.5)+
   facet_wrap(~Trait) +
   ggthemes::theme_hc() +
-  labs(x="Household income quintile",title = "On most traits, evidence of a 'scholarship student effect'",subtitle = "Normalized 'ground truth' score for students within each income quintile", y = NULL)
+  labs(x="Household income quintile",title = "And so within selective programs, negative relationship between SES and scores",subtitle = "Normalized 'ground truth' score for students within each income quintile", y = NULL)
 
 interview_scores %>% 
   left_join(ground_truth_scores) %>% 
@@ -524,7 +528,7 @@ interview_scores %>%
   ylim(-1.5,1.5)+
   facet_wrap(~Trait) +
   ggthemes::theme_hc() +
-  labs(x="Household income quintile",title = "Peer scores drive the trend",subtitle = "Average score assigned by peers to classmates from different household incomes", y = NULL)
+  labs(x="Household income quintile",title = "Peer scores had a similar trend",subtitle = "Average score assigned by peers to classmates from different household incomes", y = NULL)
 
 
 interview_scores %>% 
@@ -553,7 +557,7 @@ interview_scores %>%
   ylim(-1.5,1.5)+
   facet_wrap(~Trait) +
   ggthemes::theme_hc() +
-  labs(x="Household income quintile",title = "And teachers gave much lower scores to students from richer backgrounds",subtitle = "Average score assigned by teachers to classmates from different household incomes", y = NULL)
+  labs(x="Household income quintile",title = "Teachers gave much lower scores to students from richer backgrounds",subtitle = "Average score assigned by teachers to classmates from different household incomes", y = NULL)
 
 interview_scores %>% 
   left_join(ground_truth_scores) %>% 
@@ -622,18 +626,62 @@ interview_scores %>%
   guides(alpha= F, colour = F) +
   labs(alpha = NULL, colour = NULL, 
        x="Household income quintile",
-       title = "Interviewers boosted richer candidates, and penalized poorer students",subtitle = "Average scores", y = NULL)
+       title = "In contrast, interviewers boosted richer candidates",subtitle = "Average scores", y = NULL)
 
 
-# Plots of interviewability vs interviews ---------------------------------
+# Double residualization ---------------------------------
+
+residualization_modeling_data <- interview_scores %>% 
+  left_join(ground_truth_scores) %>% 
+  left_join(peer_teacher_scores) %>% 
+  left_join(student_numbers %>% select(`Student ID`, student_index)) %>%
+  mutate(`Student ID` = tolower(`Student ID`)) %>%
+  group_by(Trait, group_index) %>% 
+  mutate(theta = scale(theta), 
+         interview_score = scale(interview_score)) %>%
+  left_join(demographics_2, by = c("Student ID" = "Student.ID")) %>% 
+  filter(!is.na(Family_income_quintile)) %>%
+  mutate(Income_quintile = case_when(Family_income_quintile == "Fifth quintile (Bottom 20%)" ~ 1, 
+                                     Family_income_quintile == "Fourth quintile" ~ 2, 
+                                     Family_income_quintile == "Third quintile" ~ 3,
+                                     Family_income_quintile == "Second quintile" ~ 4,
+                                     Family_income_quintile == "Top quintile (Top 20%)" ~ 5,
+                                     TRUE ~ NA_real_)) %>% 
+  ungroup %>%
+  mutate_if(is.character, as.factor)
 
 
+X <- model.matrix(~ Paid_subscriptions + 
+                    Mobile_plan_type + School_type + ESL +
+                    factor(group_index) +
+                    Gender + Education_country + 
+                    Age + English_speaking_household + 
+                    Trait +Scholarship + Guardian_one_education + 
+                    Family_income_quintile, data = residualization_modeling_data)
 
-# Bias plots --------------------------------------------------------------
+y_1 <- residualization_modeling_data$interview_score
+
+y_2 <- residualization_modeling_data$theta
+
+library(glmnet)
+cvfit_y1 <- cv.glmnet(X, y_1, nfolds = nrow(residualization_modeling_data))
+cvfit_y2 <- cv.glmnet(X, y_2, nfolds = nrow(residualization_modeling_data))
+
+residualization_modeling_data$interview_resid <-y_1-  predict(cvfit_y1, s = "lambda.1se", newx = X)
+residualization_modeling_data$gt_resid <- y_2 - predict(cvfit_y2, s = "lambda.1se", newx = X)
 
 
+residualization_modeling_data %>% 
+  ggplot(aes(x = interview_score, y = theta)) +
+  geom_point(alpha = 0.4)+
+  facet_wrap(~Trait) +
+  geom_smooth(method = "lm")
 
-# Double residualization plots, no school ID  -----------------------------
+residualization_modeling_data %>% 
+  ggplot(aes(x = interview_resid, y = theta)) +
+  geom_point(alpha = 0.4)+
+  facet_wrap(~Trait) +
+  geom_smooth(method = "lm")
 
 
 
@@ -641,6 +689,138 @@ interview_scores %>%
 
 # Fit model for peer review ----
 
-# 
+
+compiled_peer_review_model <- cmdstan_model("peer_review_model_2.stan")
+
+peer_review_model_data <- peer_review_likert %>%
+  filter(!is.na(numeric_response)) %>% 
+  ungroup %>%
+  mutate(item_index = as.numeric(as.factor(paste0(Trait, Question_number)))) %>% 
+  left_join(student_numbers %>% select(`User ID`, student_index), by = c("UID2" = "User ID" )) %>% 
+  filter(!is.na(student_index)) %>% 
+  mutate(student_index_2 = as.numeric(ordered(student_index)),
+         reviewer_index = as.numeric(as.factor(`What is your name?`)))
+
+items_to_traits <- peer_review_model_data %>% 
+  group_by(student_index_2, item_index) %>% 
+  summarise(student_index = first(student_index), 
+            Trait = first(Trait))
+
+data_list_peer_review <-  list(N = nrow(peer_review_model_data),
+                               I = max(peer_review_model_data$item_index),
+                               R = max(peer_review_model_data$reviewer_index),
+                               J = max(peer_review_model_data$student_index_2),
+                               C = max(peer_review_model_data$item_index),
+                               y = peer_review_model_data$numeric_response,
+                               reviewer = peer_review_model_data$reviewer_index,
+                               reviewee = peer_review_model_data$student_index_2,
+                               concept=peer_review_model_data$item_index,
+                               item = peer_review_model_data$item_index)
 
 
+
+if(!paste0(date_of_analysis, "-peer_review.RDS") %in% dir()) {
+  peer_review_fit <- compiled_peer_review_model$sample(data = data_list_peer_review, parallel_chains = 4, iter_warmup = 1000, iter_sampling = 300, output_dir = ".")
+  peer_review_fit$save_object(file = paste0(date_of_analysis, "-peer_review.RDS"))
+} else {
+  peer_review_fit <- readRDS(paste0(date_of_analysis, "-peer_review.RDS"))
+}
+
+peer_review_theta <- peer_review_fit$summary("latent_scores")
+
+
+peer_review_scores <- tibble(var = peer_review_theta$variable, 
+                             peer_review_score = peer_review_theta$mean, 
+                             item_index = parse_number(str_extract(var, ",[0-9]{1,4}")),
+                             student_index_2 = parse_number(str_extract(var, "[0-9]{1,3},"))) %>%
+  left_join(items_to_traits) %>%
+  left_join(student_numbers %>% select(group, student_index)) %>% 
+  left_join(groups) %>% 
+  left_join(attributes) %>%
+  select(student_index, peer_review_score, Trait, trait_index, item_index, group_index) %>% 
+  filter(!is.na(student_index))
+
+for(t in unique(peer_review_scores$Trait)) {
+  print(peer_review_scores %>% 
+    left_join(interview_scores) %>% 
+    left_join(ground_truth_scores) %>% 
+    filter(Trait == t) %>% 
+    group_by(group_index, item_index) %>% 
+    mutate(peer_review_score = scale(peer_review_score)) %>%
+    ggplot(aes(x = peer_review_score, y = theta)) +
+    geom_point(alpha = 0.2) +
+    geom_smooth(method = "lm") +
+    facet_wrap(~factor(item_index)) +
+    labs(title = t))
+}
+
+peer_review_scores %>% 
+  left_join(interview_scores) %>% 
+  left_join(ground_truth_scores) %>% 
+  filter(item_index %in% c(22, 23, 2, 4)) %>% 
+  group_by(group_index, item_index) %>% 
+  mutate(peer_review_score = scale(peer_review_score)) %>%
+  group_by(student_index, Trait) %>% 
+  summarise(peer_review_score = mean(peer_review_score),
+            theta = mean(theta)) %>% 
+  ggplot(aes(x = peer_review_score, y = theta)) +
+  geom_point(alpha = 0.3) +
+  facet_wrap(~Trait) +
+  geom_smooth(method = "lm") +
+  ggthemes::theme_hc() +
+  labs(x = "Peer review score", y = "Ground truth score", title = "Peer reviewers seemed able to spot Boost and Spike from short videos")
+  
+
+
+peer_review_scores %>% 
+  left_join(interview_scores) %>% 
+  left_join(ground_truth_scores) %>% 
+  filter(item_index %in% c(22, 23, 2, 4)) %>% 
+  group_by(group_index, item_index) %>% 
+  mutate(peer_review_score = scale(peer_review_score)) %>%
+  group_by(student_index, Trait) %>% 
+  summarise(peer_review_score = mean(peer_review_score),
+            interview = mean(interview_score)) %>% 
+  ggplot(aes(x = peer_review_score, y = interview)) +
+  geom_point(alpha = 0.3) +
+  facet_wrap(~Trait) +
+  geom_smooth(method = "lm") +
+  ggthemes::theme_hc() +
+  labs(x = "Peer review score", y = "Interview score", title = "Peer review scores corresponded very strongly with interview scores")
+
+selection_scores <- ground_truth_scores %>% 
+  left_join(interview_scores) %>% 
+  filter(Trait %in% c("Intelligence", "Perseverance", "Empthy", "Resilience")) %>%
+  group_by(student_index) %>% 
+  summarise(`Selection score` = mean(theta))
+
+peer_review_scores %>% 
+  left_join(selection_scores) %>% 
+  left_join(student_numbers %>% select(`Student ID`, student_index)) %>%
+  filter(item_index %in% c(22, 23, 2, 4)) %>% 
+  group_by(group_index, item_index) %>% 
+  mutate(peer_review_score = scale(peer_review_score)) %>%
+  group_by(student_index, `Student ID`) %>% 
+  summarise(peer_review_score = mean(peer_review_score),
+            selection_score = mean(`Selection score`)) %>%
+  ggplot(aes(x = peer_review_score, y = selection_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  ggthemes::theme_hc() +
+  labs(x = "Peer review score (Boost and Spike only)", y = "Selection score", title = "Peer review alone would give us a similar class to interviewing teachers and peers!", subtitle ="Selection score = sum of 'ground truth' scores for Intelligence, Empathy, Integrity and Perseverance")
+
+peer_review_scores %>% 
+  left_join(interview_scores) %>% 
+  left_join(ground_truth_scores) %>% 
+  left_join(student_numbers %>% select(`Student ID`, student_index)) %>%
+  filter(item_index %in% c(22, 23, 2, 4)) %>% 
+  group_by(group_index, item_index) %>% 
+  mutate(peer_review_score = scale(peer_review_score)) %>%
+  group_by(student_index, `Student ID`) %>% 
+  summarise(peer_review_score = mean(peer_review_score),
+            selection_score = mean(theta)) %>%
+  ggplot(aes(x = peer_review_score, y = selection_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  ggthemes::theme_hc() +
+  labs(x = "Peer review score (Boost and Spike only)", y = "Selection score", title = "And even better if our selection was on Boost and Spike", subtitle ="Selection score = Ground truth Boost score + Spike score")
