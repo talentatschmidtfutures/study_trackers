@@ -346,7 +346,9 @@ ground_truth_scores <- tibble(var = ground_truth_thetas$variable,
   left_join(student_numbers) %>%
   left_join(attributes) %>% 
   left_join(groups) %>% 
-  select(student_index, group_index, Trait, `User ID`,theta)
+  select(student_index, group_index, Trait, `User ID`,theta, `Student ID`) %>% 
+  mutate(`Student ID` = tolower(`Student ID`)) %>%
+  left_join(teacher_ratings_long %>% ungroup %>% select(`Student ID`,Interviewability, `Standardized Test`) %>% mutate(`Student ID` = tolower(`Student ID`)), by = "Student ID")
 
 tibble(var = ground_truth_thetas$variable, 
        theta = ground_truth_thetas$mean, 
@@ -792,7 +794,27 @@ selection_scores <- ground_truth_scores %>%
   left_join(interview_scores) %>% 
   filter(Trait %in% c("Intelligence", "Perseverance", "Empthy", "Resilience")) %>%
   group_by(student_index) %>% 
-  summarise(`Selection score` = mean(theta))
+  summarise(`'True' Selection score` = mean(theta),
+            `'Interview only' selection score` = mean(interview_score))
+
+
+peer_review_scores %>% 
+  left_join(selection_scores) %>% 
+  left_join(student_numbers %>% select(`Student ID`, student_index)) %>%
+  filter(item_index %in% c(22, 23, 2, 4)) %>% 
+  group_by(group_index, item_index) %>% 
+  mutate(peer_review_score = scale(peer_review_score)) %>%
+  group_by(student_index, `Student ID`) %>% 
+  summarise(`'Interview only' selection score` = mean(`'Interview only' selection score`),
+            selection_score = mean(`'True' Selection score`)) %>%
+  ggplot(aes(x = `'Interview only' selection score`, y = selection_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  ggthemes::theme_hc() +
+  labs(x = "Interview score (Empathy + Intelligence + Integrity + Perseverance)", 
+       y = "Ground truth", 
+       title = "Interviews alone would have done a bad job at picking the class", subtitle = "Interviews vs 'ground truth' scores")
+
 
 peer_review_scores %>% 
   left_join(selection_scores) %>% 
@@ -818,9 +840,9 @@ peer_review_scores %>%
   mutate(peer_review_score = scale(peer_review_score)) %>%
   group_by(student_index, `Student ID`) %>% 
   summarise(peer_review_score = mean(peer_review_score),
-            selection_score = mean(theta)) %>%
+            selection_score = mean(theta) + mean(interview_score)) %>%
   ggplot(aes(x = peer_review_score, y = selection_score)) +
   geom_point(alpha = 0.3) +
   geom_smooth(method = "lm") +
   ggthemes::theme_hc() +
-  labs(x = "Peer review score (Boost and Spike only)", y = "Selection score", title = "And even better if our selection was on Boost and Spike", subtitle ="Selection score = Ground truth Boost score + Spike score")
+  labs(x = "Peer review score (Boost and Spike only)", y = "Selection score", title = "If we were to have been doing selection on interview + ground truth Spike + Boost...", subtitle ="Selection score = Ground truth Boost score + Spike score")
